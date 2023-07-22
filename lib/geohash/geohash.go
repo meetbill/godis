@@ -1,7 +1,6 @@
 package geohash
 
 import (
-	"bytes"
 	"encoding/base32"
 	"encoding/binary"
 )
@@ -18,10 +17,12 @@ func encode0(latitude, longitude float64, bitSize uint) ([]byte, [2][2]float64) 
 		{-90, 90},   // lat
 	}
 	pos := [2]float64{longitude, latitude}
-	hash := &bytes.Buffer{}
-	bit := 0
+	hashLen := bitSize >> 3
+	if bitSize&7 > 0 {
+		hashLen++
+	}
+	hash := make([]byte, hashLen)
 	var precision uint = 0
-	code := uint8(0)
 	for precision < bitSize {
 		for direction, val := range pos {
 			mid := (box[direction][0] + box[direction][1]) / 2
@@ -29,13 +30,7 @@ func encode0(latitude, longitude float64, bitSize uint) ([]byte, [2][2]float64) 
 				box[direction][1] = mid
 			} else {
 				box[direction][0] = mid
-				code |= bits[bit]
-			}
-			bit++
-			if bit == 8 {
-				hash.WriteByte(code)
-				bit = 0
-				code = 0
+				hash[precision>>3] |= 1 << (7 - precision&7)
 			}
 			precision++
 			if precision == bitSize {
@@ -43,11 +38,8 @@ func encode0(latitude, longitude float64, bitSize uint) ([]byte, [2][2]float64) 
 			}
 		}
 	}
-	// precision%8 > 0
-	if code > 0 {
-		hash.WriteByte(code)
-	}
-	return hash.Bytes(), box
+
+	return hash, box
 }
 
 // Encode converts latitude and longitude to uint64 geohash code

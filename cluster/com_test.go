@@ -4,18 +4,18 @@ import (
 	"github.com/hdt3213/godis/config"
 	"github.com/hdt3213/godis/lib/utils"
 	"github.com/hdt3213/godis/redis/connection"
-	"github.com/hdt3213/godis/redis/reply/asserts"
+	"github.com/hdt3213/godis/redis/protocol/asserts"
 	"testing"
 )
 
 func TestExec(t *testing.T) {
-	testCluster2 := MakeTestCluster([]string{"127.0.0.1:6379"})
-	conn := &connection.FakeConn{}
+	testCluster := testCluster[0]
+	conn := connection.NewFakeConn()
 	for i := 0; i < 1000; i++ {
 		key := RandString(4)
 		value := RandString(4)
-		testCluster2.Exec(conn, toArgs("SET", key, value))
-		ret := testCluster2.Exec(conn, toArgs("GET", key))
+		testCluster.Exec(conn, toArgs("SET", key, value))
+		ret := testCluster.Exec(conn, toArgs("GET", key))
 		asserts.AssertBulkReply(t, ret, value)
 	}
 }
@@ -26,7 +26,8 @@ func TestAuth(t *testing.T) {
 	defer func() {
 		config.Properties.RequirePass = ""
 	}()
-	conn := &connection.FakeConn{}
+	conn := connection.NewFakeConn()
+	testCluster := testCluster[0]
 	ret := testCluster.Exec(conn, toArgs("GET", "a"))
 	asserts.AssertErrReply(t, ret, "NOAUTH Authentication required")
 	ret = testCluster.Exec(conn, toArgs("AUTH", passwd))
@@ -36,21 +37,21 @@ func TestAuth(t *testing.T) {
 }
 
 func TestRelay(t *testing.T) {
-	testCluster2 := MakeTestCluster([]string{"127.0.0.1:6379"})
+	testNodeA := testCluster[1]
 	key := RandString(4)
 	value := RandString(4)
-	conn := &connection.FakeConn{}
-	ret := testCluster2.relay("127.0.0.1:6379", conn, toArgs("SET", key, value))
+	conn := connection.NewFakeConn()
+	ret := testNodeA.relay(addresses[1], conn, toArgs("SET", key, value))
 	asserts.AssertNotError(t, ret)
-	ret = testCluster2.relay("127.0.0.1:6379", conn, toArgs("GET", key))
+	ret = testNodeA.relay(addresses[1], conn, toArgs("GET", key))
 	asserts.AssertBulkReply(t, ret, value)
 }
 
 func TestBroadcast(t *testing.T) {
-	testCluster2 := MakeTestCluster([]string{"127.0.0.1:6379"})
+	testCluster2 := testCluster[0]
 	key := RandString(4)
 	value := RandString(4)
-	rets := testCluster2.broadcast(&connection.FakeConn{}, toArgs("SET", key, value))
+	rets := testCluster2.broadcast(connection.NewFakeConn(), toArgs("SET", key, value))
 	for _, v := range rets {
 		asserts.AssertNotError(t, v)
 	}

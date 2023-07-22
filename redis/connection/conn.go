@@ -1,22 +1,32 @@
 package connection
 
 import (
-	"bytes"
+	"github.com/hdt3213/godis/lib/logger"
 	"github.com/hdt3213/godis/lib/sync/wait"
 	"net"
 	"sync"
 	"time"
 )
 
+const (
+	// flagSlave means this a connection with slave
+	flagSlave = uint64(1 << iota)
+	// flagSlave means this a connection with master
+	flagMaster
+	// flagMulti means this connection is within a transaction
+	flagMulti
+)
+
 // Connection represents a connection with a redis-cli
 type Connection struct {
 	conn net.Conn
 
-	// waiting until reply finished
-	waitingReply wait.Wait
+	// wait until finish sending data, used for graceful shutdown
+	sendingData wait.Wait
 
 	// lock while server sending response
-	mu sync.Mutex
+	mu    sync.Mutex
+	flags uint64
 
 	// subscribing channels
 	subs map[string]bool
@@ -25,47 +35,70 @@ type Connection struct {
 	password string
 
 	// queued commands for `multi`
-	multiState bool
-	queue      [][][]byte
-	watching   map[string]uint32
+	queue    [][][]byte
+	watching map[string]uint32
+	txErrors []error
 
 	// selected db
 	selectedDB int
 }
 
+var connPool = sync.Pool{
+	New: func() interface{} {
+		return &Connection{}
+	},
+}
+
 // RemoteAddr returns the remote network address
-func (c *Connection) RemoteAddr() net.Addr {
-	return c.conn.RemoteAddr()
+func (c *Connection) RemoteAddr() string {
+	return c.conn.RemoteAddr().String()
 }
 
 // Close disconnect with the client
 func (c *Connection) Close() error {
-	c.waitingReply.WaitWithTimeout(10 * time.Second)
+	c.sendingData.WaitWithTimeout(10 * time.Second)
 	_ = c.conn.Close()
+	c.subs = nil
+	c.password = ""
+	c.queue = nil
+	c.watching = nil
+	c.txErrors = nil
+	c.selectedDB = 0
+	connPool.Put(c)
 	return nil
 }
 
 // NewConn creates Connection instance
 func NewConn(conn net.Conn) *Connection {
-	return &Connection{
-		conn: conn,
+	c, ok := connPool.Get().(*Connection)
+	if !ok {
+		logger.Error("connection pool make wrong type")
+		return &Connection{
+			conn: conn,
+		}
 	}
+	c.conn = conn
+	return c
 }
 
 // Write sends response to client over tcp connection
-func (c *Connection) Write(b []byte) error {
+func (c *Connection) Write(b []byte) (int, error) {
 	if len(b) == 0 {
-		return nil
+		return 0, nil
 	}
-	c.mu.Lock()
-	c.waitingReply.Add(1)
+	c.sendingData.Add(1)
 	defer func() {
-		c.waitingReply.Done()
-		c.mu.Unlock()
+		c.sendingData.Done()
 	}()
 
-	_, err := c.conn.Write(b)
-	return err
+	return c.conn.Write(b)
+}
+
+func (c *Connection) Name() string {
+	if c.conn != nil {
+		return c.conn.RemoteAddr().String()
+	}
+	return ""
 }
 
 // Subscribe add current connection into subscribers of the given channel
@@ -119,30 +152,48 @@ func (c *Connection) GetPassword() string {
 	return c.password
 }
 
+// InMultiState tells is connection in an uncommitted transaction
 func (c *Connection) InMultiState() bool {
-	return c.multiState
+	return c.flags&flagMulti > 0
 }
 
+// SetMultiState sets transaction flag
 func (c *Connection) SetMultiState(state bool) {
 	if !state { // reset data when cancel multi
 		c.watching = nil
 		c.queue = nil
+		c.flags &= ^flagMulti // clean multi flag
+		return
 	}
-	c.multiState = state
+	c.flags |= flagMulti
 }
 
+// GetQueuedCmdLine returns queued commands of current transaction
 func (c *Connection) GetQueuedCmdLine() [][][]byte {
 	return c.queue
 }
 
+// EnqueueCmd  enqueues command of current transaction
 func (c *Connection) EnqueueCmd(cmdLine [][]byte) {
 	c.queue = append(c.queue, cmdLine)
 }
 
+// AddTxError stores syntax error within transaction
+func (c *Connection) AddTxError(err error) {
+	c.txErrors = append(c.txErrors, err)
+}
+
+// GetTxErrors returns syntax error within transaction
+func (c *Connection) GetTxErrors() []error {
+	return c.txErrors
+}
+
+// ClearQueuedCmds clears queued commands of current transaction
 func (c *Connection) ClearQueuedCmds() {
 	c.queue = nil
 }
 
+// GetWatching returns watching keys and their version code when started watching
 func (c *Connection) GetWatching() map[string]uint32 {
 	if c.watching == nil {
 		c.watching = make(map[string]uint32)
@@ -150,32 +201,28 @@ func (c *Connection) GetWatching() map[string]uint32 {
 	return c.watching
 }
 
+// GetDBIndex returns selected db
 func (c *Connection) GetDBIndex() int {
 	return c.selectedDB
 }
 
+// SelectDB selects a database
 func (c *Connection) SelectDB(dbNum int) {
 	c.selectedDB = dbNum
 }
 
-// FakeConn implements redis.Connection for test
-type FakeConn struct {
-	Connection
-	buf bytes.Buffer
+func (c *Connection) SetSlave() {
+	c.flags |= flagSlave
 }
 
-// Write writes data to buffer
-func (c *FakeConn) Write(b []byte) error {
-	c.buf.Write(b)
-	return nil
+func (c *Connection) IsSlave() bool {
+	return c.flags&flagSlave > 0
 }
 
-// Clean resets the buffer
-func (c *FakeConn) Clean() {
-	c.buf.Reset()
+func (c *Connection) SetMaster() {
+	c.flags |= flagMaster
 }
 
-// Bytes returns written data
-func (c *FakeConn) Bytes() []byte {
-	return c.buf.Bytes()
+func (c *Connection) IsMaster() bool {
+	return c.flags&flagMaster > 0
 }

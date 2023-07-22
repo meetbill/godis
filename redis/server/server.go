@@ -6,19 +6,20 @@ package server
 
 import (
 	"context"
-	"github.com/hdt3213/godis"
+	"io"
+	"net"
+	"strings"
+	"sync"
+
 	"github.com/hdt3213/godis/cluster"
 	"github.com/hdt3213/godis/config"
+	database2 "github.com/hdt3213/godis/database"
 	"github.com/hdt3213/godis/interface/database"
 	"github.com/hdt3213/godis/lib/logger"
 	"github.com/hdt3213/godis/lib/sync/atomic"
 	"github.com/hdt3213/godis/redis/connection"
 	"github.com/hdt3213/godis/redis/parser"
-	"github.com/hdt3213/godis/redis/reply"
-	"io"
-	"net"
-	"strings"
-	"sync"
+	"github.com/hdt3213/godis/redis/protocol"
 )
 
 var (
@@ -35,11 +36,10 @@ type Handler struct {
 // MakeHandler creates a Handler instance
 func MakeHandler() *Handler {
 	var db database.DB
-	if config.Properties.Self != "" &&
-		len(config.Properties.Peers) > 0 {
+	if config.Properties.ClusterEnable {
 		db = cluster.MakeCluster()
 	} else {
-		db = godis.NewStandaloneServer()
+		db = database2.NewStandaloneServer()
 	}
 	return &Handler{
 		db: db,
@@ -57,10 +57,11 @@ func (h *Handler) Handle(ctx context.Context, conn net.Conn) {
 	if h.closing.Get() {
 		// closing handler refuse new connection
 		_ = conn.Close()
+		return
 	}
 
 	client := connection.NewConn(conn)
-	h.activeConn.Store(client, 1)
+	h.activeConn.Store(client, struct{}{})
 
 	ch := parser.ParseStream(conn)
 	for payload := range ch {
@@ -70,15 +71,15 @@ func (h *Handler) Handle(ctx context.Context, conn net.Conn) {
 				strings.Contains(payload.Err.Error(), "use of closed network connection") {
 				// connection closed
 				h.closeClient(client)
-				logger.Info("connection closed: " + client.RemoteAddr().String())
+				logger.Info("connection closed: " + client.RemoteAddr())
 				return
 			}
 			// protocol err
-			errReply := reply.MakeErrReply(payload.Err.Error())
-			err := client.Write(errReply.ToBytes())
+			errReply := protocol.MakeErrReply(payload.Err.Error())
+			_, err := client.Write(errReply.ToBytes())
 			if err != nil {
 				h.closeClient(client)
-				logger.Info("connection closed: " + client.RemoteAddr().String())
+				logger.Info("connection closed: " + client.RemoteAddr())
 				return
 			}
 			continue
@@ -87,16 +88,16 @@ func (h *Handler) Handle(ctx context.Context, conn net.Conn) {
 			logger.Error("empty payload")
 			continue
 		}
-		r, ok := payload.Data.(*reply.MultiBulkReply)
+		r, ok := payload.Data.(*protocol.MultiBulkReply)
 		if !ok {
-			logger.Error("require multi bulk reply")
+			logger.Error("require multi bulk protocol")
 			continue
 		}
 		result := h.db.Exec(client, r.Args)
 		if result != nil {
-			_ = client.Write(result.ToBytes())
+			_, _ = client.Write(result.ToBytes())
 		} else {
-			_ = client.Write(unknownErrReplyBytes)
+			_, _ = client.Write(unknownErrReplyBytes)
 		}
 	}
 }

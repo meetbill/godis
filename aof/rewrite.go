@@ -1,137 +1,147 @@
 package aof
 
 import (
-	"github.com/hdt3213/godis/config"
-	"github.com/hdt3213/godis/interface/database"
-	"github.com/hdt3213/godis/lib/logger"
-	"github.com/hdt3213/godis/lib/utils"
-	"github.com/hdt3213/godis/redis/reply"
-	"io/ioutil"
+	"io"
 	"os"
 	"strconv"
-	"time"
+
+	"github.com/hdt3213/godis/config"
+	"github.com/hdt3213/godis/lib/logger"
+	"github.com/hdt3213/godis/lib/utils"
+	"github.com/hdt3213/godis/redis/protocol"
 )
 
-func (handler *Handler) newRewriteHandler() *Handler {
-	h := &Handler{}
-	h.aofFilename = handler.aofFilename
-	h.db = handler.tmpDBMaker()
+func (persister *Persister) newRewriteHandler() *Persister {
+	h := &Persister{}
+	h.aofFilename = persister.aofFilename
+	h.db = persister.tmpDBMaker()
 	return h
 }
 
-func (handler *Handler) Rewrite() {
-	tmpFile, fileSize, err := handler.startRewrite()
-	if err != nil {
-		logger.Warn(err)
-		return
-	}
-
-	// load aof tmpFile
-	tmpAof := handler.newRewriteHandler()
-	tmpAof.LoadAof(int(fileSize))
-
-	// rewrite aof tmpFile
-	for i := 0; i < config.Properties.Databases; i++ {
-		// select db
-		data := reply.MakeMultiBulkReply(utils.ToCmdLine("SELECT", strconv.Itoa(i))).ToBytes()
-		_, err := tmpFile.Write(data)
-		if err != nil {
-			logger.Warn(err)
-			return
-		}
-		// dump db
-		tmpAof.db.ForEach(i, func(key string, entity *database.DataEntity, expiration *time.Time) bool {
-			cmd := EntityToCmd(key, entity)
-			if cmd != nil {
-				_, _ = tmpFile.Write(cmd.ToBytes())
-			}
-			if expiration != nil {
-				cmd := MakeExpireCmd(key, *expiration)
-				if cmd != nil {
-					_, _ = tmpFile.Write(cmd.ToBytes())
-				}
-			}
-			return true
-		})
-	}
-
-	handler.finishRewrite(tmpFile)
+// RewriteCtx holds context of an AOF rewriting procedure
+type RewriteCtx struct {
+	tmpFile  *os.File // tmpFile is the file handler of aof tmpFile
+	fileSize int64
+	dbIdx    int // selected db index when startRewrite
 }
 
-func (handler *Handler) startRewrite() (*os.File, int64, error) {
-	handler.pausingAof.Lock() // pausing aof
-	defer handler.pausingAof.Unlock()
+// Rewrite carries out AOF rewrite
+func (persister *Persister) Rewrite() error {
+	ctx, err := persister.StartRewrite()
+	if err != nil {
+		return err
+	}
+	err = persister.DoRewrite(ctx)
+	if err != nil {
+		return err
+	}
 
-	err := handler.aofFile.Sync()
+	persister.FinishRewrite(ctx)
+	return nil
+}
+
+// DoRewrite actually rewrite aof file
+// makes DoRewrite public for testing only, please use Rewrite instead
+func (persister *Persister) DoRewrite(ctx *RewriteCtx) (err error) {
+	// start rewrite
+	if !config.Properties.AofUseRdbPreamble {
+		logger.Info("generate aof preamble")
+		err = persister.generateAof(ctx)
+	} else {
+		logger.Info("generate rdb preamble")
+		err = persister.generateRDB(ctx)
+	}
+	return err
+}
+
+// StartRewrite prepares rewrite procedure
+func (persister *Persister) StartRewrite() (*RewriteCtx, error) {
+	// pausing aof
+	persister.pausingAof.Lock()
+	defer persister.pausingAof.Unlock()
+
+	err := persister.aofFile.Sync()
 	if err != nil {
 		logger.Warn("fsync failed")
-		return nil, 0, err
+		return nil, err
 	}
-	// create rewrite channel
-	handler.aofRewriteBuffer = make(chan *payload, aofQueueSize)
 
 	// get current aof file size
-	fileInfo, _ := os.Stat(handler.aofFilename)
+	fileInfo, _ := os.Stat(persister.aofFilename)
 	filesize := fileInfo.Size()
 
 	// create tmp file
-	file, err := ioutil.TempFile("", "aof")
+	file, err := os.CreateTemp(config.GetTmpDir(), "*.aof")
 	if err != nil {
 		logger.Warn("tmp file create failed")
-		return nil, 0, err
+		return nil, err
 	}
-	return file, filesize, nil
+	return &RewriteCtx{
+		tmpFile:  file,
+		fileSize: filesize,
+		dbIdx:    persister.currentDB,
+	}, nil
 }
 
-func (handler *Handler) finishRewrite(tmpFile *os.File) {
-	handler.pausingAof.Lock() // pausing aof
-	defer handler.pausingAof.Unlock()
+// FinishRewrite finish rewrite procedure
+func (persister *Persister) FinishRewrite(ctx *RewriteCtx) {
+	persister.pausingAof.Lock() // pausing aof
+	defer persister.pausingAof.Unlock()
+	tmpFile := ctx.tmpFile
 
-	// write commands created during rewriting to tmp file
-	currentDB := -1
-loop:
-	for {
-		// aof is pausing, there won't be any new commands in aofRewriteBuffer
-		select {
-		case p := <-handler.aofRewriteBuffer:
-			if p.dbIndex != currentDB {
-				// select db
-				// always do `select` during first loop 第一次进入循环时必须执行一次 select 确保数据库一致
-				data := reply.MakeMultiBulkReply(utils.ToCmdLine("SELECT", strconv.Itoa(p.dbIndex))).ToBytes()
-				_, err := tmpFile.Write(data)
-				if err != nil {
-					logger.Warn(err)
-					continue // skip this command
-				}
-				currentDB = p.dbIndex
-			}
-			data := reply.MakeMultiBulkReply(p.cmdLine).ToBytes()
-			_, err := tmpFile.Write(data)
-			if err != nil {
-				logger.Warn(err)
-			}
-		default:
-			// channel is empty, break loop
-			break loop
+	// copy commands executed during rewriting to tmpFile
+	errOccurs := func() bool {
+		/* read write commands executed during rewriting */
+		src, err := os.Open(persister.aofFilename)
+		if err != nil {
+			logger.Error("open aofFilename failed: " + err.Error())
+			return true
 		}
+		defer func() {
+			_ = src.Close()
+			_ = tmpFile.Close()
+		}()
+
+		_, err = src.Seek(ctx.fileSize, 0)
+		if err != nil {
+			logger.Error("seek failed: " + err.Error())
+			return true
+		}
+		// sync tmpFile's db index with online aofFile
+		data := protocol.MakeMultiBulkReply(utils.ToCmdLine("SELECT", strconv.Itoa(ctx.dbIdx))).ToBytes()
+		_, err = tmpFile.Write(data)
+		if err != nil {
+			logger.Error("tmp file rewrite failed: " + err.Error())
+			return true
+		}
+		// copy data
+		_, err = io.Copy(tmpFile, src)
+		if err != nil {
+			logger.Error("copy aof filed failed: " + err.Error())
+			return true
+		}
+		return false
+	}()
+	if errOccurs {
+		return
 	}
-	close(handler.aofRewriteBuffer)
-	handler.aofRewriteBuffer = nil
 
 	// replace current aof file by tmp file
-	_ = handler.aofFile.Close()
-	_ = os.Rename(tmpFile.Name(), handler.aofFilename)
-
+	_ = persister.aofFile.Close()
+	if err := os.Rename(tmpFile.Name(), persister.aofFilename); err != nil {
+		logger.Warn(err)
+	}
 	// reopen aof file for further write
-	aofFile, err := os.OpenFile(handler.aofFilename, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0600)
+	aofFile, err := os.OpenFile(persister.aofFilename, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		panic(err)
 	}
-	handler.aofFile = aofFile
+	persister.aofFile = aofFile
 
-	// reset selected db 重新写入一次 select 指令保证 aof 中的数据库与 handler.currentDB 一致
-	data := reply.MakeMultiBulkReply(utils.ToCmdLine("SELECT", strconv.Itoa(handler.currentDB))).ToBytes()
-	_, err = handler.aofFile.Write(data)
+	// write select command again to resume aof file selected db
+	// it should have the same db index with  persister.currentDB
+	data := protocol.MakeMultiBulkReply(utils.ToCmdLine("SELECT", strconv.Itoa(persister.currentDB))).ToBytes()
+	_, err = persister.aofFile.Write(data)
 	if err != nil {
 		panic(err)
 	}

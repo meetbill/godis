@@ -18,6 +18,7 @@
     - flushall
     - keys
     - bgrewriteaof
+    - copy
 - String
     - set
     - setnx
@@ -27,12 +28,15 @@
     - mget
     - msetnx
     - get
+    - getex
     - getset
+    - getdel
     - incr
     - incrby
     - incrbyfloat
     - decr
     - decrby
+    - randomkey
 - List
     - lpush
     - lpushx
@@ -46,6 +50,8 @@
     - lindex
     - lset
     - lrange
+    - ltrim
+    - linsert
 - Hash
     - hset
     - hsetnx
@@ -53,6 +59,7 @@
     - hexists
     - hdel
     - hlen
+    - hstrlen
     - hmget
     - hmset
     - hkeys
@@ -60,10 +67,12 @@
     - hgetall
     - hincrby
     - hincrbyfloat
+    - hrandfield
 - Set
     - sadd
     - sismember
     - srem
+    - spop
     - scard
     - smembers
     - sinter
@@ -88,6 +97,10 @@
     - zrem
     - zremrangebyscore
     - zremrangebyrank
+    - zlexcount
+    - zrangebylex
+    - zremrangebylex
+    - zrevrangebylex
 - Pub / Sub
     - publish
     - subscribe

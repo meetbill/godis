@@ -1,7 +1,7 @@
 # Godis
 
 ![license](https://img.shields.io/github/license/HDT3213/godis)
-[![Build Status](https://travis-ci.com/HDT3213/godis.svg?branch=master)](https://travis-ci.com/HDT3213/godis)
+[![Build Status](https://github.com/hdt3213/godis/actions/workflows/coverall.yml/badge.svg)](https://github.com/HDT3213/godis/actions?query=branch%3Amaster)
 [![Coverage Status](https://coveralls.io/repos/github/HDT3213/godis/badge.svg?branch=master)](https://coveralls.io/github/HDT3213/godis?branch=master)
 [![Go Report Card](https://goreportcard.com/badge/github.com/HDT3213/godis)](https://goreportcard.com/report/github.com/HDT3213/godis)
 <br>
@@ -10,16 +10,18 @@
 Godis 是一个用 Go 语言实现的 Redis 服务器。本项目旨在为尝试使用 Go 语言开发高并发中间件的朋友提供一些参考。
 
 关键功能:
-- 支持 string, list, hash, set, sorted set 数据结构
+- 支持 string, list, hash, set, sorted set, bitmap 数据结构
 - 自动过期功能(TTL)
 - 发布订阅
 - 地理位置
 - AOF 持久化及 AOF 重写
+- 加载和导出 RDB 文件
+- 主从复制 (测试中)
 - Multi 命令开启的事务具有`原子性`和`隔离性`. 若在执行过程中遇到错误, godis 会回滚已执行的命令
 - 内置集群模式. 集群对客户端是透明的, 您可以像使用单机版 redis 一样使用 godis 集群
-  - `MSET`, `DEL` 命令在集群模式下原子性执行
-  - `Rename`, `RenameNX` 命令在集群模式下支持在同一个 slot 内执行
-  - Multi 命令开启的事务在集群模式下支持在同一个 slot 内执行
+  - 使用 raft 算法维护集群元数据(测试中)
+  - `MSET`, `MSETNX`, `DEL`, `Rename`, `RenameNX`  命令在集群模式下原子性执行, 允许 key 在集群的不同节点上
+  - 在集群模式下支持在同一个 slot 内执行事务
 - 并行引擎, 无需担心您的操作会阻塞整个服务器.
 
 可以在[我的博客](https://www.cnblogs.com/Finley/category/1598973.html)了解更多关于
@@ -72,7 +74,7 @@ redis-cli -p 6399
 
 环境:
 
-Go version：1.16
+Go version：1.17
 
 System: macOS Catalina 10.15.7
 
@@ -116,23 +118,24 @@ MSET (10 keys): 65487.89 requests per second
 
 本项目的目录结构:
 
-- github.com/hdt3213/godis/cmd: main 函数，执行入口
-- github.com/hdt3213/godis/config: 配置文件解析
-- github.com/hdt3213/godis/interface: 一些模块间的接口定义
-- github.com/hdt3213/godis/lib: 各种工具，比如logger、同步和通配符
+- 根目录: main 函数，执行入口
+- config: 配置文件解析
+- interface: 一些模块间的接口定义
+- lib: 各种工具，比如logger、同步和通配符
 
 建议按照下列顺序阅读各包:
 
-- github.com/hdt3213/godis/tcp: tcp 服务器实现
-- github.com/hdt3213/godis/redis: redis 协议解析器
-- github.com/hdt3213/godis/datastruct: redis 的各类数据结构实现
+- tcp: tcp 服务器实现
+- redis: redis 协议解析器
+- datastruct: redis 的各类数据结构实现
     - dict: hash 表
     - list: 链表
     - lock: 用于锁定 key 的锁组件
     - set： 基于hash表的集合
     - sortedset: 基于跳表实现的有序集合
-- github.com/hdt3213/godis: 存储引擎核心
-    - db.go: 引擎的基础功能
+- database: 存储引擎核心
+    - server.go: redis 服务实例, 支持多数据库, 持久化, 主从复制等能力
+    - database.go: 单个 database 的数据结构和功能
     - router.go: 将命令路由给响应的处理函数
     - keys.go: del、ttl、expire 等通用命令实现
     - string.go: get、set 等字符串命令实现
@@ -141,4 +144,17 @@ MSET (10 keys): 65487.89 requests per second
     - set.go: sadd 等集合命令实现
     - sortedset.go: zadd 等有序集合命令实现
     - pubsub.go: 发布订阅命令实现
-    - aof.go: aof持久化实现
+    - geo.go: GEO 相关命令实现
+    - sys.go: Auth 等系统功能实现
+    - transaction.go: 单机事务实现
+- cluster: 集群
+  - cluster.go: 集群入口
+  - com.go: 节点间通信
+  - del.go: delete 命令原子性实现
+  - keys.go: key 相关命令集群中实现
+  - mset.go: mset 命令原子性实现
+  - multi.go: 集群内事务实现
+  - pubsub.go: 发布订阅实现
+  - rename.go: rename 命令集群实现
+  - tcc.go: tcc 分布式事务底层实现
+- aof: AOF 持久化实现 

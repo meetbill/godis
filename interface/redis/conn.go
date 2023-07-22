@@ -2,7 +2,10 @@ package redis
 
 // Connection represents a connection with redis client
 type Connection interface {
-	Write([]byte) error
+	Write([]byte) (int, error)
+	Close() error
+	RemoteAddr() string
+
 	SetPassword(string)
 	GetPassword() string
 
@@ -12,15 +15,23 @@ type Connection interface {
 	SubsCount() int
 	GetChannels() []string
 
-	// used for `Multi` command
 	InMultiState() bool
 	SetMultiState(bool)
 	GetQueuedCmdLine() [][][]byte
 	EnqueueCmd([][]byte)
 	ClearQueuedCmds()
 	GetWatching() map[string]uint32
+	AddTxError(err error)
+	GetTxErrors() []error
 
-	// used for multi database
 	GetDBIndex() int
 	SelectDB(int)
+
+	SetSlave()
+	IsSlave() bool
+
+	SetMaster()
+	IsMaster() bool
+
+	Name() string
 }
